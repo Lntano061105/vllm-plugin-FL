@@ -40,11 +40,21 @@ FL plugin on vLLM 0.13:
   2x l2norm_fwd + npu_recurrent_gated_delta_rule calls. The in-kernel
   sigmoid-gating section of the upstream kernel is miscompiled by the
   Ascend Triton pipeline in this environment, so the gating stays on the
-  AscendC op. Set ``VLLM_FL_DISABLE_FUSED_DECODE_GDN=1`` to fall back to
-  the AscendC recurrent op.
+  AscendC op. The padded state-selection fault observed at batch 64 has been
+  fixed and covered by batch 64/63/33 graph-replay smoke tests. The kernel is
+  still disabled by default because the current throughput A/B is neutral; set
+  ``VLLM_FL_ENABLE_FUSED_DECODE_GDN=1`` to opt in. The legacy
+  ``VLLM_FL_DISABLE_FUSED_DECODE_GDN=1`` override still takes precedence.
+* An experimental mixed-batch path can split the decode prefix from the
+  prefill suffix: decode tokens use the AscendC recurrent op while only
+  prefill tokens use the chunk kernel. The first batch-64 smoke showed a large
+  regression while also adding recurrent + chunk launches, so it is disabled
+  by default pending an isolated A/B; set ``VLLM_FL_ENABLE_MIXED_GDN_SPLIT=1``
+  only for controlled experiments.
 * ``RMSNormGated.forward_oot`` runs the fused Triton
   ``layer_norm_fwd_1pass`` kernel (ported from vllm-ascend) instead of the
-  decomposed eager ``forward_native`` chain.
+  decomposed eager ``forward_native`` chain. Set
+  ``VLLM_FL_DISABLE_FUSED_RMSNORM_GATED=1`` for an isolated A/B fallback.
 * Fresh (all-zero ``initial_state``) prefill batches run the fused
   PTO/Bisheng megakernel (vllm-ascend PR #8872 port,
   ``vllm_fl/ops/pto_chunk_gdn``): all six GDN stages in a single launch.
@@ -205,11 +215,54 @@ def _build_actual_seq_lengths(
     return actual_seq_lengths
 
 
+def _slice_mixed_prefill_metadata(
+    query_start_loc: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    num_decodes: int,
+    num_prefills: int,
+    num_decode_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return metadata for the prefill suffix of a decode-first mixed batch."""
+    prefill_row_end = num_decodes + num_prefills
+    prefill_query_start_loc = (
+        query_start_loc[num_decodes : prefill_row_end + 1] - num_decode_tokens
+    )
+    return (
+        prefill_query_start_loc,
+        state_indices[num_decodes:prefill_row_end],
+        has_initial_state[num_decodes:prefill_row_end],
+    )
+
+
 def _fused_decode_gdn_enabled() -> bool:
     """Whether to use the fused Triton decode kernel (q/k L2 norm +
     recurrent delta-rule state update in a single launch, adapted from
-    vllm-ascend) for non-speculative decode batches."""
-    return os.environ.get("VLLM_FL_DISABLE_FUSED_DECODE_GDN", "0") != "1"
+    vllm-ascend) for non-speculative decode batches.
+
+    Keep the kernel opt-in after the batch-64/63/33 graph-replay stability fix:
+    the current throughput A/B is neutral and token/state numerical parity
+    still needs dedicated coverage. The legacy disable flag wins so existing
+    launch scripts remain safe.
+    """
+    if os.environ.get("VLLM_FL_DISABLE_FUSED_DECODE_GDN", "0") == "1":
+        return False
+    return os.environ.get("VLLM_FL_ENABLE_FUSED_DECODE_GDN", "0") == "1"
+
+
+def _mixed_gdn_split_enabled() -> bool:
+    """Whether to split decode and prefill GDN work in a mixed batch.
+
+    Keep this experimental path opt-in: it replaces one chunk-kernel call per
+    GDN layer with recurrent + chunk + concatenate operations, and its first
+    batch-64 smoke showed a large regression that still needs isolated A/B.
+    """
+    return os.environ.get("VLLM_FL_ENABLE_MIXED_GDN_SPLIT", "0") == "1"
+
+
+def _fused_rmsnorm_gated_enabled() -> bool:
+    """Whether to replace RMSNormGated.forward_oot with the fused kernel."""
+    return os.environ.get("VLLM_FL_DISABLE_FUSED_RMSNORM_GATED", "0") != "1"
 
 
 def _cache_conv1d_weight_transposed(layer: Qwen3NextGatedDeltaNet) -> None:
@@ -287,20 +340,27 @@ def _pto_prefill_usable(attn_metadata) -> bool:
     return getattr(attn_metadata, "any_initial_state_cpu", True) is False
 
 
-def _patch_gdn_metadata_host_flags() -> None:
-    """Attach CPU-side prefill flags to ``GDNAttentionMetadata``.
+def _patch_gdn_metadata_builder() -> None:
+    """Attach sync-free PTO flags and reusable mixed-batch metadata.
 
     ``any_initial_state_cpu`` and ``cu_seqlens_host`` let ``_forward_core``
     pick PTO vs Triton and size the megakernel workspaces without any
     device→host synchronization (the generic PTO wrapper previously paid one
     ``torch.any(initial_state != 0)`` plus one ``.cpu().tolist()`` sync per
     GDN layer per prefill step — a measurable regression at batch64).
+
+    When the experimental mixed split is enabled, mixed batches also reuse
+    the same decode lengths and prefill suffix metadata in every GDN layer.
+    Building them here once per scheduler step avoids two small tensor
+    constructions per layer (48 layers for 27B).
     """
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 
     orig_build = GDNAttentionMetadataBuilder.build
+    if getattr(orig_build, "_vllm_fl_gdn_metadata", False):
+        return
 
-    def build_with_host_flags(
+    def build_with_gdn_metadata(
         self,
         common_prefix_len,
         common_attn_metadata,
@@ -310,15 +370,48 @@ def _patch_gdn_metadata_host_flags() -> None:
         attn_metadata = orig_build(
             self, common_prefix_len, common_attn_metadata, *args, **kwargs
         )
-        if attn_metadata.num_prefills > 0:
+        if attn_metadata.num_prefills > 0 and _pto_available():
             context_lens_cpu = common_attn_metadata.num_computed_tokens_cpu
             attn_metadata.any_initial_state_cpu = bool((context_lens_cpu > 0).any())
             qsl_cpu = common_attn_metadata.query_start_loc_cpu
             attn_metadata.cu_seqlens_host = tuple(int(x) for x in qsl_cpu.tolist())
+
+        if (
+            _mixed_gdn_split_enabled()
+            and attn_metadata.spec_sequence_masks is None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes > 0
+        ):
+            query_start_loc = attn_metadata.non_spec_query_start_loc
+            state_indices = attn_metadata.non_spec_state_indices_tensor
+            has_initial_state = attn_metadata.has_initial_state
+            assert query_start_loc is not None
+            assert state_indices is not None
+            assert has_initial_state is not None
+
+            attn_metadata.mixed_decode_actual_seq_lengths = (
+                _build_actual_seq_lengths(
+                    query_start_loc[: attn_metadata.num_decodes + 1],
+                    attn_metadata.num_decodes,
+                )
+            )
+            (
+                attn_metadata.mixed_prefill_query_start_loc,
+                attn_metadata.mixed_prefill_state_indices,
+                attn_metadata.mixed_prefill_has_initial_state,
+            ) = _slice_mixed_prefill_metadata(
+                query_start_loc,
+                state_indices,
+                has_initial_state,
+                attn_metadata.num_decodes,
+                attn_metadata.num_prefills,
+                attn_metadata.num_decode_tokens,
+            )
         return attn_metadata
 
-    GDNAttentionMetadataBuilder.build = build_with_host_flags
-    logger.info("Patched GDNAttentionMetadataBuilder with CPU prefill flags for PTO")
+    build_with_gdn_metadata._vllm_fl_gdn_metadata = True
+    GDNAttentionMetadataBuilder.build = build_with_gdn_metadata
+    logger.info("Patched GDNAttentionMetadataBuilder with sync-free GDN metadata")
 
 
 def _chunk_gdn_pto(q, k, v, g, beta, cu_seqlens, attn_metadata):
@@ -579,6 +672,14 @@ class AscendCGatedDeltaNet(Qwen3NextGatedDeltaNet):
             g_non_spec = g
             beta_non_spec = beta
 
+        split_non_spec = (
+            _mixed_gdn_split_enabled()
+            and spec_sequence_masks is None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes > 0
+        )
+        num_decode_tokens = attn_metadata.num_decode_tokens
+
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             actual_seq_lengths = _build_actual_seq_lengths(
@@ -603,9 +704,94 @@ class AscendCGatedDeltaNet(Qwen3NextGatedDeltaNet):
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
-        # 2.2: Process the remaining part
+        # 2.2: Keep decode tokens on the recurrent kernel in mixed batches.
+        # The vLLM GDN metadata builder orders non-speculative decode requests
+        # before prefill requests, so the first ``num_decode_tokens`` rows are
+        # the decode prefix. The recurrent op updates those SSM slots in place.
+        if split_non_spec:
+            assert mixed_qkv_non_spec is not None
+            assert g_non_spec is not None
+            assert beta_non_spec is not None
+            assert non_spec_query_start_loc is not None
+            assert non_spec_state_indices_tensor is not None
+
+            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+                mixed_qkv_non_spec[:num_decode_tokens]
+            )
+            decode_query_start_loc = non_spec_query_start_loc[
+                : attn_metadata.num_decodes + 1
+            ]
+            actual_seq_lengths = getattr(
+                attn_metadata, "mixed_decode_actual_seq_lengths", None
+            )
+            if actual_seq_lengths is None:
+                actual_seq_lengths = _build_actual_seq_lengths(
+                    decode_query_start_loc, attn_metadata.num_decodes
+                )
+            query_decode = l2norm_fwd(query_decode)
+            key_decode = l2norm_fwd(key_decode)
+            core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                query=query_decode.squeeze(0),
+                key=key_decode.squeeze(0),
+                value=value_decode.squeeze(0),
+                g=g_non_spec[:, :num_decode_tokens].squeeze(0),
+                beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
+                state=ssm_state,
+                scale=key_decode.shape[-1] ** -0.5,
+                actual_seq_lengths=actual_seq_lengths,
+                ssm_state_indices=non_spec_state_indices_tensor[
+                    : attn_metadata.num_decodes
+                ],
+            ).unsqueeze(0)
+        else:
+            core_attn_out_decode = None
+
+        # 2.3: Process the remaining prefill or pure-decode part.
         if attn_metadata.num_prefills > 0:
-            if _pto_prefill_usable(attn_metadata):
+            assert non_spec_query_start_loc is not None
+            assert non_spec_state_indices_tensor is not None
+            assert has_initial_state is not None
+
+            if split_non_spec:
+                prefill_query_start_loc = getattr(
+                    attn_metadata, "mixed_prefill_query_start_loc", None
+                )
+                prefill_state_indices = getattr(
+                    attn_metadata, "mixed_prefill_state_indices", None
+                )
+                prefill_has_initial_state = getattr(
+                    attn_metadata, "mixed_prefill_has_initial_state", None
+                )
+                if (
+                    prefill_query_start_loc is None
+                    or prefill_state_indices is None
+                    or prefill_has_initial_state is None
+                ):
+                    (
+                        prefill_query_start_loc,
+                        prefill_state_indices,
+                        prefill_has_initial_state,
+                    ) = _slice_mixed_prefill_metadata(
+                        non_spec_query_start_loc,
+                        non_spec_state_indices_tensor,
+                        has_initial_state,
+                        attn_metadata.num_decodes,
+                        attn_metadata.num_prefills,
+                        num_decode_tokens,
+                    )
+                query_non_spec = query_non_spec[:, num_decode_tokens:]
+                key_non_spec = key_non_spec[:, num_decode_tokens:]
+                value_non_spec = value_non_spec[:, num_decode_tokens:]
+                g_non_spec = g_non_spec[:, num_decode_tokens:]
+                beta_non_spec = beta_non_spec[:, num_decode_tokens:]
+            else:
+                prefill_query_start_loc = non_spec_query_start_loc
+                prefill_state_indices = non_spec_state_indices_tensor
+                prefill_has_initial_state = has_initial_state
+
+            # The current PTO host flags describe the full non-spec batch, so
+            # they cannot be reused for a sliced mixed-prefill suffix yet.
+            if not split_non_spec and _pto_prefill_usable(attn_metadata):
                 # Fresh prefill batch: the fused PTO megakernel runs all six
                 # GDN stages in a single launch. The decision is made from
                 # CPU-side metadata (no device sync).
@@ -615,16 +801,16 @@ class AscendCGatedDeltaNet(Qwen3NextGatedDeltaNet):
                     value_non_spec,
                     g_non_spec,
                     beta_non_spec,
-                    non_spec_query_start_loc,
+                    prefill_query_start_loc,
                     attn_metadata,
                 )
             else:
                 # Chunked prefill stays on the (Ascend Triton) chunk kernel, which
                 # uses the FLA (Hv, Dk, Dv) state layout: transpose at the boundary.
                 initial_state = (
-                    ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
+                    ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
                 )
-                initial_state[~has_initial_state, ...] = 0
+                initial_state[~prefill_has_initial_state, ...] = 0
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
@@ -636,14 +822,19 @@ class AscendCGatedDeltaNet(Qwen3NextGatedDeltaNet):
                     beta=beta_non_spec,
                     initial_state=initial_state,
                     output_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc,
+                    cu_seqlens=prefill_query_start_loc,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
             # Init cache
-            ssm_state[non_spec_state_indices_tensor] = (
+            ssm_state[prefill_state_indices] = (
                 last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             )
+            if split_non_spec:
+                assert core_attn_out_decode is not None
+                core_attn_out_non_spec = torch.cat(
+                    [core_attn_out_decode, core_attn_out_non_spec], dim=1
+                )
         elif attn_metadata.num_decodes > 0:
             if _fused_decode_gdn_enabled():
                 # One fused Triton launch: q/k L2 norm + delta-rule state
@@ -658,9 +849,10 @@ class AscendCGatedDeltaNet(Qwen3NextGatedDeltaNet):
                     g=g_non_spec.squeeze(0).contiguous(),
                     beta=beta_non_spec.squeeze(0).contiguous(),
                     initial_state_source=ssm_state,
-                    initial_state_indices=non_spec_state_indices_tensor[
-                        : attn_metadata.num_decodes
-                    ],
+                    # FULL graph metadata is padded to the capture batch.
+                    # Keep the matching -1 tail so zero-length programs never
+                    # index past a real-request-only slice during replay.
+                    initial_state_indices=non_spec_state_indices_tensor,
                     cu_seqlens=non_spec_query_start_loc,
                     use_qk_l2norm_in_kernel=True,
                 )
@@ -765,15 +957,20 @@ def patch_qwen3_6_gdn() -> bool:
     Qwen3NextGatedDeltaNet._forward_core = AscendCGatedDeltaNet._forward_core
     _patch_mamba_cache_dense_layout()
     GemmaRMSNorm.forward_oot = AscendCGemmaRMSNorm.forward_oot
-    RMSNormGated.forward_oot = AscendCRMSNormGated.forward_oot
-    if _pto_available():
-        _patch_gdn_metadata_host_flags()
+    if _fused_rmsnorm_gated_enabled():
+        RMSNormGated.forward_oot = AscendCRMSNormGated.forward_oot
+    if _pto_available() or _mixed_gdn_split_enabled():
+        _patch_gdn_metadata_builder()
     logger.info(
         "Patched Qwen3NextGatedDeltaNet and GemmaRMSNorm/RMSNormGated for Ascend "
         "(AscendC causal_conv1d / fused_gdn_gating / recurrent_gated_delta_rule "
-        "/ gemma_rms_norm, fused Triton delta-rule decode update: %s, "
+        "/ gemma_rms_norm, mixed decode/prefill GDN split: %s, "
+        "fused Triton delta-rule decode update: %s, "
+        "fused RMSNormGated: %s, "
         "PTO megakernel for fresh prefill: %s)",
+        "on" if _mixed_gdn_split_enabled() else "off",
         "on" if _fused_decode_gdn_enabled() else "off",
+        "on" if _fused_rmsnorm_gated_enabled() else "off",
         "on" if _pto_available() else "off",
     )
     return True

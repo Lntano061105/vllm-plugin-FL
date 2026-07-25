@@ -99,7 +99,26 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.utils.platform_utils import is_pin_memory_available
 
-from vllm.platforms import current_platform
+_ENABLE_NPU_SLOT_MAPPING = (
+    os.environ.get("VLLM_FL_ENABLE_NPU_SLOT_MAPPING", "0") == "1"
+)
+_SKIP_MAMBA_SLOT_MAPPING = (
+    os.environ.get("VLLM_FL_SKIP_MAMBA_SLOT_MAPPING", "1") != "0"
+)
+_NPU_SLOT_MAPPING_DECODE_ONLY = (
+    os.environ.get("VLLM_FL_NPU_SLOT_MAPPING_DECODE_ONLY", "1") != "0"
+)
+compute_slot_mapping_npu = None
+if _ENABLE_NPU_SLOT_MAPPING and current_platform.device_type == "npu":
+    try:
+        # Optional Ascend-only Triton slot-mapping kernel backported from
+        # vllm-ascend PR #12096. Keep it opt-in until the 35B A/B confirms the
+        # gain on this exact vLLM 0.13 / hybrid-cache configuration.
+        from vllm_fl.dispatch.backends.vendor.ascend.impl.compute_slot_mapping import (  # noqa: E501
+            compute_slot_mapping_npu,
+        )
+    except ImportError:
+        compute_slot_mapping_npu = None
 
 if current_platform.dist_backend in ("flagcx", "hccl"):
     @contextmanager
@@ -225,6 +244,23 @@ from vllm_fl.dispatch.io_dumper import (
 )
 
 logger = init_logger(__name__)
+
+if _ENABLE_NPU_SLOT_MAPPING:
+    if compute_slot_mapping_npu is None:
+        logger.warning(
+            "VLLM_FL_ENABLE_NPU_SLOT_MAPPING=1, but the Ascend slot-mapping "
+            "kernel could not be imported; falling back to the CPU path."
+        )
+    else:
+        logger.info(
+            "Ascend NPU slot-mapping kernel enabled (%s mode).",
+            "decode-only" if _NPU_SLOT_MAPPING_DECODE_ONLY else "all-batch",
+        )
+if _SKIP_MAMBA_SLOT_MAPPING:
+    logger.info(
+        "Mamba/GDN slot mapping disabled "
+        "(VLLM_FL_SKIP_MAMBA_SLOT_MAPPING=1)."
+    )
 
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -422,6 +458,7 @@ class ModelRunnerFL(
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
+        self._slot_mapping_block_tables: tuple[Any, ...] = ()
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -1446,24 +1483,72 @@ class ModelRunnerFL(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
-
-        # Prepare the attention metadata.
+        # Prepare the per-request metadata before slot mapping. The optional
+        # NPU kernel derives each token position from query_start_loc and
+        # seq_lens, so M-RoPE models do not need an extra positions H2D copy.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-        # Note: pad query_start_loc to be non-decreasing, as kernels
-        # like FlashAttention requires that
+        # Keep padding non-decreasing for graph-captured attention kernels.
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
-        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            + num_scheduled_tokens
         )
         # Fill unused with 0 for full cuda graph mode.
         self.seq_lens.np[num_reqs:].fill(0)
-        self.seq_lens.copy_to_gpu()
+
+        try_npu_slot_mapping = (
+            _ENABLE_NPU_SLOT_MAPPING
+            and compute_slot_mapping_npu is not None
+            and bool(self._slot_mapping_block_tables)
+        )
+        if try_npu_slot_mapping and _NPU_SLOT_MAPPING_DECODE_ONLY:
+            # Slot mapping is latency-sensitive fixed work during decode, but
+            # the first A/B showed no throughput gain from adding the Triton
+            # launch to the 4K prefill path and a mean-TTFT regression at 1K.
+            # Keep prefill and mixed batches on the selected-group NumPy path.
+            try_npu_slot_mapping = bool(
+                total_num_scheduled_tokens == num_reqs
+                and np.all(num_scheduled_tokens == 1)
+                and np.all(
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    >= self.input_batch.num_prompt_tokens[:num_reqs]
+                )
+            )
+        query_start_loc_copied = False
+        seq_lens_copied = False
+        if try_npu_slot_mapping:
+            # These buffers are required by attention later in the step.
+            # Moving their normal copies ahead of slot mapping introduces no
+            # extra H2D.
+            self.query_start_loc.copy_to_gpu()
+            self.seq_lens.copy_to_gpu()
+            query_start_loc_copied = True
+            seq_lens_copied = True
+
+        slot_mapping_on_device = bool(
+            try_npu_slot_mapping
+            and compute_slot_mapping_npu(
+                self._slot_mapping_block_tables,
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.seq_lens.gpu[:num_reqs],
+            )
+        )
+        if not slot_mapping_on_device:
+            for block_table in self._slot_mapping_block_tables:
+                block_table.compute_slot_mapping(req_indices, positions_np)
+            for block_table in self._slot_mapping_block_tables:
+                block_table.commit_slot_mapping(total_num_scheduled_tokens)
+
+        # The NPU slot-mapping path already copied this buffer before launching
+        # its kernel.
+        if not query_start_loc_copied:
+            self.query_start_loc.copy_to_gpu()
+        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+        if not seq_lens_copied:
+            self.seq_lens.copy_to_gpu()
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -5480,6 +5565,45 @@ class ModelRunnerFL(
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+
+        # vLLM 0.13's block-table constructor has no KV-cache type metadata.
+        # Attach the information here, where the runner still knows the cache
+        # groups, so slot mapping can skip Mamba/GDN groups that never consume
+        # it. This mirrors newer vllm-ascend behavior without guessing from
+        # block sizes.
+        block_table_idx = 0
+        for kv_cache_group in kv_cache_config.kv_cache_groups:
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                group_specs = tuple(kv_cache_spec.kv_cache_specs.values())
+                is_mamba_group = bool(group_specs) and all(
+                    isinstance(spec, MambaSpec) for spec in group_specs
+                )
+            block_table = self.input_batch.block_table.block_tables[block_table_idx]
+            block_table.is_mamba_group = is_mamba_group
+            block_table_idx += 1
+
+        all_block_tables = tuple(self.input_batch.block_table.block_tables)
+        assert block_table_idx == len(all_block_tables)
+        if _SKIP_MAMBA_SLOT_MAPPING:
+            self._slot_mapping_block_tables = tuple(
+                block_table
+                for block_table in all_block_tables
+                if not block_table.is_mamba_group
+            )
+        else:
+            self._slot_mapping_block_tables = all_block_tables
+
+        if _SKIP_MAMBA_SLOT_MAPPING:
+            logger.info_once(
+                "Slot mapping will run for %d/%d KV-cache groups; "
+                "Mamba/GDN groups do not consume slot mapping.",
+                len(self._slot_mapping_block_tables),
+                len(all_block_tables),
+            )
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )

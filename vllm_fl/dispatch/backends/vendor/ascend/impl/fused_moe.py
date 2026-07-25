@@ -15,6 +15,74 @@ import torch_npu
 logger = logging.getLogger(__name__)
 
 _ASCENDC_MOE_AVAILABLE: bool | None = None
+_MOE_GMM_TUNING_MAX_TOKENS = 256
+
+
+def _parse_moe_gmm_tuning_mode(value: str | None) -> str | int | None:
+    """Parse the experimental GroupedMatmul tuning mode.
+
+    ``auto`` derives the expected tokens per expert from a static small-token
+    graph shape. A positive integer forces that expectation for controlled
+    decode micro-benchmarking.
+    The default is disabled so existing deployments keep identical operator
+    arguments until an A/B demonstrates a gain on their model and SoC.
+    """
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("", "0", "off", "false", "none"):
+        return None
+    if normalized == "auto":
+        return "auto"
+    try:
+        expected_tokens = int(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_FL_MOE_GMM_TUNING must be off, auto, or a positive integer"
+        ) from exc
+    if expected_tokens <= 0:
+        raise ValueError(
+            "VLLM_FL_MOE_GMM_TUNING must be off, auto, or a positive integer"
+        )
+    return expected_tokens
+
+
+try:
+    _MOE_GMM_TUNING_MODE = _parse_moe_gmm_tuning_mode(
+        os.environ.get("VLLM_FL_MOE_GMM_TUNING")
+    )
+except ValueError as exc:
+    logger.warning("%s; disabling MoE GMM tuning", exc)
+    _MOE_GMM_TUNING_MODE = None
+
+
+def _build_moe_gmm_tuning_config(
+    num_tokens: int | torch.SymInt,
+    top_k: int | torch.SymInt,
+    num_experts: int | torch.SymInt,
+    mode: str | int | None,
+    *,
+    has_expert_map: bool,
+) -> list[int] | None:
+    """Return the ACLNN GMM tiling hint for the current static shape.
+
+    Expert-parallel routing is intentionally excluded from the first A/B:
+    the local expert-token distribution is not represented by the simple
+    global average used for TP-only Qwen3.6. Dynamic symbolic shapes and
+    prefill-sized inputs are also excluded so the hint cannot add graph
+    specialization or change prefill tiling during a decode-throughput A/B.
+    """
+    if mode is None or has_expert_map:
+        return None
+    if (
+        isinstance(num_tokens, torch.SymInt)
+        or num_tokens > _MOE_GMM_TUNING_MAX_TOKENS
+    ):
+        return None
+    if isinstance(mode, int):
+        return [mode]
+    expected_tokens = (num_tokens * top_k + num_experts - 1) // num_experts
+    return [max(1, int(expected_tokens))]
 
 
 def ascendc_moe_available() -> bool:
@@ -54,6 +122,13 @@ def ascendc_moe_available() -> bool:
         logger.warning("torch.ops._C_ascend missing ops %s; keep torch_npu MoE path", missing)
         _ASCENDC_MOE_AVAILABLE = False
         return False
+    if _MOE_GMM_TUNING_MODE is not None:
+        logger.info(
+            "Experimental MoE GroupedMatmul tuning enabled: %s "
+            "(static num_tokens <= %d)",
+            _MOE_GMM_TUNING_MODE,
+            _MOE_GMM_TUNING_MAX_TOKENS,
+        )
     _ASCENDC_MOE_AVAILABLE = True
     return True
 
@@ -156,11 +231,14 @@ def _ascendc_fused_experts_impl(
     # Map global expert ids to local expert ids.  Out-of-range entries are
     # clamped to 0 and masked to zero weight so the graph shape stays static.
     if expert_map is not None:
-        mask = expert_map[topk_ids.long()] != -1
-        local_topk_ids = expert_map[topk_ids.long()].clamp(min=0)
+        mapped_topk_ids = expert_map[topk_ids.long()]
+        mask = mapped_topk_ids != -1
+        local_topk_ids = mapped_topk_ids.clamp(min=0)
         topk_weights = topk_weights * mask.to(topk_weights.dtype)
     else:
-        local_topk_ids = topk_ids.long()
+        local_topk_ids = topk_ids
+    if local_topk_ids.dtype != torch.int32:
+        local_topk_ids = local_topk_ids.to(torch.int32)
 
     # Expand tokens according to top-k expert assignment and sort them by
     # expert.  expanded_row_idx maps each sorted row back to the original
@@ -168,7 +246,7 @@ def _ascendc_fused_experts_impl(
     expanded_x, expanded_row_idx, expert_token_count, _ = (
         torch.ops._C_ascend.npu_moe_init_routing_custom(
             hidden_states,
-            local_topk_ids.to(torch.int32),
+            local_topk_ids,
             active_num=num_tokens * top_k,
             expert_num=global_num_experts,
             drop_pad_mode=0,
@@ -178,6 +256,19 @@ def _ascendc_fused_experts_impl(
             active_expert_range=[0, E],
             row_idx_type=0,
         )
+    )
+
+    gmm_tuning_config = _build_moe_gmm_tuning_config(
+        num_tokens,
+        top_k,
+        global_num_experts,
+        _MOE_GMM_TUNING_MODE,
+        has_expert_map=expert_map is not None,
+    )
+    gmm_tuning_kwargs = (
+        {"tuning_config": gmm_tuning_config}
+        if gmm_tuning_config is not None
+        else {}
     )
 
     # Apply router weight on the expanded tokens if requested.
@@ -201,6 +292,7 @@ def _ascendc_fused_experts_impl(
         split_item=2,
         group_type=0,
         group_list_type=1,
+        **gmm_tuning_kwargs,
     )[0]
 
     # Activation.
@@ -225,6 +317,7 @@ def _ascendc_fused_experts_impl(
         split_item=2,
         group_type=0,
         group_list_type=1,
+        **gmm_tuning_kwargs,
     )[0]
 
     # Scatter/sum the expert outputs back to the token dimension.
@@ -276,18 +369,21 @@ def _torch_fused_experts_impl(
     # Map global expert ids to local expert ids.  Out-of-range entries are
     # clamped to 0 and masked to zero weight so the graph shape stays static.
     if expert_map is not None:
-        mask = expert_map[topk_ids.long()] != -1
-        local_topk_ids = expert_map[topk_ids.long()].clamp(min=0)
+        mapped_topk_ids = expert_map[topk_ids.long()]
+        mask = mapped_topk_ids != -1
+        local_topk_ids = mapped_topk_ids.clamp(min=0)
         topk_weights = topk_weights * mask.to(topk_weights.dtype)
     else:
-        local_topk_ids = topk_ids.long()
+        local_topk_ids = topk_ids
+    if local_topk_ids.dtype != torch.int32:
+        local_topk_ids = local_topk_ids.to(torch.int32)
 
     # Expand tokens according to top-k expert assignment and sort them by
     # expert.  row_idx maps each sorted row back to the original flat
     # (token*topk + k) position.
     expanded_x, row_idx, expert_token_count, _ = torch_npu.npu_moe_init_routing_v2(
         hidden_states,
-        local_topk_ids.to(torch.int32),
+        local_topk_ids,
         active_num=num_tokens * top_k,
         expert_num=global_num_experts,
         expert_tokens_num_type=1,  # count mode

@@ -124,6 +124,14 @@ If there are multiple plugins in the current environment, you can specify use vl
 
     Ascend requires eager execution. Add `enforce_eager=True` to the `LLM` constructor or pass `--enforce-eager` on the command line.
 
+#### Qwen3.6 graph-mode optimization
+
+The experimental Qwen3.6 Ascend branch also supports graph-mode serving on the
+validated vLLM 0.13.0 stack. See the
+[Qwen3.6 Ascend graph-mode optimization guide](./QWEN36_ASCEND_OPTIMIZATION.md)
+for compatibility limits, safe defaults, feature flags, benchmark results, and
+rollback instructions. The general release guidance above remains unchanged.
+
 
 ### Run a Task
 

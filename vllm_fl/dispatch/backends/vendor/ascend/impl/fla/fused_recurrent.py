@@ -53,15 +53,16 @@ def fused_recurrent_delta_rule_update_kernel(
     miscompiled by the Ascend Triton pipeline in this environment.
     """
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV - 1, i_nh % HV
-    # The grid carries one dummy group of HV programs up front: the first
-    # scheduled program on this Ascend Triton pipeline sporadically
-    # produces a corrupted state/output tile (verified on 910B4-1 with the
-    # CANN 8.5.0 bishengir pipeline; every other program is exact), so it
-    # is made to return immediately and all real sequences are shifted to
-    # healthy programs.
-    if i_n < 0:
-        return
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    if IS_VARLEN:
+        i_n -= 1
+        # Each varlen launch carries one dummy sequence up front: the first
+        # scheduled program on this Ascend Triton pipeline sporadically
+        # produces a corrupted state/output tile (verified on 910B4-1 with
+        # the CANN 8.5.0 bishengir pipeline), so the dummy programs return
+        # immediately and all real sequences are shifted to healthy ones.
+        if i_n < 0:
+            return
     i_h = i_hv // (HV // H)
 
     if IS_VARLEN:
@@ -71,6 +72,11 @@ def fused_recurrent_delta_rule_update_kernel(
         )
         all = T
         T = eos - bos
+        # FULL graph replay pads metadata to the captured batch size. Those
+        # tail sequences have length zero and slot index -1; return before
+        # reading h0_indices or deriving any state pointer.
+        if T == 0:
+            return
     else:
         bos, eos = i_n * T, i_n * T + T
         all = B * T
@@ -98,12 +104,13 @@ def fused_recurrent_delta_rule_update_kernel(
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n).to(tl.int64)
-        # if idx >= 0:
-        tmp0 = tl.where(idx < 0, 0, idx)
-        p_h0 = h0_source + tmp0 * HV * K * V + i_hv * K * V + o_v[:, None] * K + o_k[None, :]
-        temp1 = tl.load(p_h0, mask=mask_h_t, other=0).to(tl.float32)
-        temp2 = tl.zeros_like(temp1)
-        b_h += tl.where(idx < 0, temp2, temp1)
+        # A tensor-wide tl.where on the 64x128 fp32 tile is miscompiled by
+        # the current Ascend Triton backend (the failing PC lands inside the
+        # generated vsel helper). Use the same scalar branch as the state
+        # store below so no invalid pointer or tensor select is generated.
+        if idx >= 0:
+            p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_v[:, None] * K + o_k[None, :]
+            b_h += tl.load(p_h0, mask=mask_h_t, other=0).to(tl.float32)
 
     for i in range(0, T):
         # Load inputs
@@ -180,6 +187,11 @@ def fused_recurrent_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
+    if initial_state_indices.shape[0] < N:
+        raise ValueError(
+            "initial_state_indices must cover every padded varlen sequence"
+        )
+
     if cu_seqlens is not None:
         # One extra group of dummy programs is prepended in the grid (the
         # kernel returns immediately for them) to absorb the corrupted
@@ -192,8 +204,11 @@ def fused_recurrent_delta_rule_update(
     if not initial_state_indices.is_contiguous():
         initial_state_indices = initial_state_indices.contiguous()
     if not initial_state_source.is_contiguous():
-        initial_state_source = initial_state_source.contiguous()
-    if not cu_seqlens.is_contiguous():
+        raise ValueError(
+            "initial_state_source must be contiguous because the fused kernel "
+            "updates it in place"
+        )
+    if cu_seqlens is not None and not cu_seqlens.is_contiguous():
         cu_seqlens = cu_seqlens.contiguous()
 
     fused_recurrent_delta_rule_update_kernel[grid](
